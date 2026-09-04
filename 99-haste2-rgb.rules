@@ -1,0 +1,17 @@
+# HyperX Pulsefire Haste 2 - RGB control interface
+# VID:PID 03f0:0b97, HID interface 02
+#
+# Usamos ENV{ID_VENDOR_ID}/ENV{ID_MODEL_ID} (propriedades já importadas
+# pela regra 60-persistent-hidraw.rules via usb_id) em vez de
+# ATTRS{idVendor}/ATTRS{idProduct}. Isso importa: ATTRS{idVendor} e
+# ATTRS{idProduct} vivem no dispositivo USB pai (o mouse inteiro), mas
+# ATTRS{bInterfaceNumber} vive na interface USB filha (a porta 02) — e o
+# udev exige que TODOS os ATTRS{} de uma regra pertençam ao MESMO
+# ancestral. Misturando os dois níveis numa regra só, a condição nunca
+# bate e a regra é ignorada em silêncio (sem erro nenhum no log).
+#
+# MODE="0666" garante leitura/escrita assim que o dispositivo é criado,
+# sem depender do systemd-logind aplicar uaccess numa sessão ativa (isso
+# falha quando o mouse já está plugado no boot, antes do login).
+# TAG+="uaccess" fica de brinde, sem custo, caso o ambiente prefira ACL.
+ACTION=="add", SUBSYSTEM=="hidraw", ENV{ID_VENDOR_ID}=="03f0", ENV{ID_MODEL_ID}=="0b97", ATTRS{bInterfaceNumber}=="02", MODE="0666", TAG+="uaccess"

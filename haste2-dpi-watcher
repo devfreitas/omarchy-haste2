@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""
+haste2-dpi-watcher - escuta passivamente o botão físico de DPI do
+HyperX Pulsefire Haste 2 e grava o valor atual em
+~/.config/haste2-rgb/dpi, pro widget da barra conseguir mostrar.
+
+NÃO escreve nada no mouse — reverse engineering confirmou que esse
+device não aceita troca de DPI via host, só pelo botão físico. Este
+daemon só observa o report que o mouse manda sozinho quando o botão é
+apertado:
+
+    fb 08 XX YY 00 00 ...   (64 bytes, na interface HID 02)
+
+onde XX é o índice do estágio (0..3) e YY = (XX << 4) | 0x0F (checksum
+derivado, sem informação extra).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+
+VID = "03f0"
+PID = "0b97"
+INTERFACE = "02"
+
+DPI_LABELS = {0: "400", 1: "800", 2: "1600", 3: "3200"}
+
+CONFIG_DIR = Path.home() / ".config" / "haste2-rgb"
+STATE_FILE = CONFIG_DIR / "dpi"
+
+FIND_RETRIES = 20
+FIND_RETRY_INTERVAL = 0.5
+
+
+def find_hidraw_once() -> str | None:
+    for p in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        dev = p / "device"
+        if not dev.exists():
+            continue
+        hid_uevent = dev / "uevent"
+        text = hid_uevent.read_text(errors="ignore") if hid_uevent.exists() else ""
+        hid_id = ""
+        for line in text.splitlines():
+            if line.startswith("HID_ID="):
+                hid_id = line.split("=", 1)[1].upper()
+        if f":0000{VID.upper()}:" not in hid_id or not hid_id.endswith(f":0000{PID.upper()}"):
+            continue
+        cur = dev.resolve()
+        for _ in range(8):
+            iface = cur / "bInterfaceNumber"
+            if iface.exists():
+                try:
+                    if iface.read_text().strip() == INTERFACE:
+                        return f"/dev/{p.name}"
+                except OSError:
+                    pass
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+    return None
+
+
+def find_hidraw(retries: int = FIND_RETRIES, interval: float = FIND_RETRY_INTERVAL) -> str | None:
+    for attempt in range(retries):
+        path = find_hidraw_once()
+        if path:
+            return path
+        if attempt < retries - 1:
+            time.sleep(interval)
+    return None
+
+
+def save_dpi(label: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(label + "\n")
+
+
+def watch_once(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        last = None
+        while True:
+            data = os.read(fd, 64)
+            if len(data) >= 3 and data[0] == 0xFB and data[1] == 0x08:
+                idx = data[2]
+                label = DPI_LABELS.get(idx)
+                if label and label != last:
+                    save_dpi(label)
+                    print(f"DPI -> {label}")
+                    last = label
+    finally:
+        os.close(fd)
+
+
+def main() -> int:
+    while True:
+        path = find_hidraw()
+        if not path:
+            print(
+                "Haste 2 não encontrado (interface 02). Tentando de novo em 5s...",
+                file=sys.stderr,
+            )
+            time.sleep(5)
+            continue
+
+        print(f"Observando DPI em {path}")
+        try:
+            watch_once(path)
+        except PermissionError:
+            print(f"Sem permissão para {path}. Confira a regra udev.", file=sys.stderr)
+            time.sleep(5)
+        except OSError as e:
+            # Mouse desconectado/reconectado: espera e tenta achar de novo.
+            print(f"Erro de leitura ({e}), tentando reconectar...", file=sys.stderr)
+            time.sleep(2)
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

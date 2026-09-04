@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""
+haste2-rgb - HyperX Pulsefire Haste 2 RGB control for Linux.
+
+Device: HyperX Pulsefire Haste 2
+VID:PID: 03f0:0b97
+HID interface: 02
+
+Protocol based on the working hidraw test and the public SignalRGB
+Haste 2 plugin implementation.
+
+The mouse does not appear to persist the color when a single report is sent,
+so this utility continuously refreshes the color while the daemon is running.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+
+VID = "03f0"
+PID = "0b97"
+INTERFACE = "02"
+REPORT_ID = 0x44
+INTERVAL = 0.05  # 20 Hz; confirmed working in my machine!!!.
+
+# Quantas vezes (e com que intervalo) tentar achar o dispositivo antes de
+# desistir. No boot, o hidraw pode demorar um instante a aparecer/ter a
+# permissão aplicada pelo udev — vale a pena esperar em vez de falhar na
+# primeira tentativa (o que derrubava o serviço e batia o start-limit do
+# systemd antes mesmo da regra udev terminar de agir).
+FIND_RETRIES = 20
+FIND_RETRY_INTERVAL = 0.5  # total: até ~10s esperando o dispositivo
+
+CONFIG_DIR = Path.home() / ".config" / "haste2-rgb"
+CONFIG_FILE = CONFIG_DIR / "color"
+SERVICE = "haste2-rgb.service"
+
+COLORS = {
+    "red": (255, 0, 0),
+    "green": (0, 255, 0),
+    "blue": (0, 0, 255),
+    "white": (255, 255, 255),
+    "yellow": (255, 255, 0),
+    "cyan": (0, 255, 255),
+    "magenta": (255, 0, 255),
+    "purple": (128, 0, 255),
+    "orange": (255, 96, 0),
+    "pink": (255, 20, 147),
+    "off": (0, 0, 0),
+}
+
+
+def find_hidraw_once() -> str | None:
+    """Procura, via sysfs, o hidraw que corresponde à interface HID 02 do
+    Haste 2. Não tem fallback chumbado: se não achar, retorna None e quem
+    chamou decide se tenta de novo ou desiste."""
+    for p in sorted(Path("/sys/class/hidraw").glob("hidraw*")):
+        dev = p / "device"
+        if not dev.exists():
+            continue
+        hid_uevent = dev / "uevent"
+        text = hid_uevent.read_text(errors="ignore") if hid_uevent.exists() else ""
+        # HID_ID é tipicamente 0003:000003F0:00000B97
+        hid_id = ""
+        for line in text.splitlines():
+            if line.startswith("HID_ID="):
+                hid_id = line.split("=", 1)[1].upper()
+        if f":0000{VID.upper()}:" not in hid_id or not hid_id.endswith(f":0000{PID.upper()}"):
+            continue
+
+        # Sobe no sysfs até achar o diretório da interface USB.
+        cur = dev.resolve()
+        for _ in range(8):
+            iface = cur / "bInterfaceNumber"
+            if iface.exists():
+                try:
+                    if iface.read_text().strip() == INTERFACE:
+                        return f"/dev/{p.name}"
+                except OSError:
+                    pass
+            if cur.parent == cur:
+                break
+            cur = cur.parent
+
+    return None
+
+
+def find_hidraw(retries: int = FIND_RETRIES, interval: float = FIND_RETRY_INTERVAL) -> str | None:
+    """Tenta achar o dispositivo repetidamente, útil logo após o boot,
+    quando o kernel/udev ainda pode não ter terminado de configurar o
+    hidraw. Não usa nenhum caminho fixo como último recurso — se não achar
+    de verdade, retorna None."""
+    for attempt in range(retries):
+        path = find_hidraw_once()
+        if path:
+            return path
+        if attempt < retries - 1:
+            time.sleep(interval)
+    return None
+
+
+def report(primer: bool, rgb: tuple[int, int, int]) -> bytes:
+    if primer:
+        # 65 bytes total: report ID + 64 payload bytes.
+        return bytes([REPORT_ID, 0x01, 0x01] + [0] * 62)
+    r, g, b = rgb
+    # 65 bytes total: report ID + 64 payload bytes.
+    return bytes([REPORT_ID, 0x02, 0x00, 0x00, r, g, b] + [0] * 58)
+
+
+def parse_color(value: str) -> tuple[int, int, int]:
+    v = value.lower().strip()
+    if v in COLORS:
+        return COLORS[v]
+    if v.startswith("#") and len(v) == 7:
+        try:
+            return tuple(int(v[i:i + 2], 16) for i in (1, 3, 5))
+        except ValueError:
+            pass
+    raise ValueError(
+        "cor inválida. Use um nome conhecido ou HEX, por exemplo #8a2be2."
+    )
+
+
+def save_color(value: str) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(value + "\n")
+
+
+def load_color() -> str:
+    if CONFIG_FILE.exists():
+        return CONFIG_FILE.read_text().strip() or "purple"
+    return "purple"
+
+
+def daemon(color_name: str) -> int:
+    rgb = parse_color(color_name)
+    path = find_hidraw()
+    if not path:
+        print(
+            "HyperX Pulsefire Haste 2 não encontrado (interface 02) após "
+            f"{FIND_RETRIES * FIND_RETRY_INTERVAL:.0f}s tentando. "
+            "O mouse está plugado? A regra udev foi instalada?",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(f"Haste 2 encontrado em {path}")
+    print(f"RGB: {color_name} -> #{rgb[0]:02x}{rgb[1]:02x}{rgb[2]:02x}")
+    print("Pressione Ctrl+C para parar.")
+
+    running = True
+
+    def stop(_sig, _frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, stop)
+    signal.signal(signal.SIGTERM, stop)
+
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except PermissionError:
+        print(
+            f"Sem permissão para {path}. Confira a regra udev "
+            "(99-haste2-rgb.rules) e rode: sudo udevadm control --reload-rules "
+            "&& sudo udevadm trigger --subsystem-match=hidraw",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        p1 = report(True, rgb)
+        p2 = report(False, rgb)
+        while running:
+            os.write(fd, p1)
+            os.write(fd, p2)
+            time.sleep(INTERVAL)
+    except PermissionError:
+        print(
+            f"Sem permissão para {path}. Instale a regra udev incluída no projeto.",
+            file=sys.stderr,
+        )
+        return 2
+    finally:
+        os.close(fd)
+
+    return 0
+
+
+def systemctl(*args: str) -> int:
+    return os.system("systemctl --user " + " ".join(args))
+
+
+def set_color(value: str) -> int:
+    parse_color(value)  # validate first
+    save_color(value)
+    rc = systemctl("restart", SERVICE)
+    if rc != 0:
+        print("Não foi possível reiniciar o serviço. Rode: systemctl --user status haste2-rgb")
+        return 1
+    print(f"Cor definida: {value}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Controla o RGB do HyperX Pulsefire Haste 2 no Linux."
+    )
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_set = sub.add_parser("set", help="define a cor")
+    p_set.add_argument("color", help="nome da cor ou HEX")
+
+    sub.add_parser("status", help="mostra o estado do serviço")
+    sub.add_parser("stop", help="para o RGB")
+
+    p_daemon = sub.add_parser("daemon", help="executa o daemon diretamente")
+    p_daemon.add_argument("--color", default=None)
+
+    args = parser.parse_args()
+
+    if args.cmd == "set":
+        return set_color(args.color)
+    if args.cmd == "status":
+        return systemctl("status", SERVICE)
+    if args.cmd == "stop":
+        return systemctl("stop", SERVICE)
+    if args.cmd == "daemon":
+        return daemon(args.color or load_color())
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
